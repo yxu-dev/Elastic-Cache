@@ -65,7 +65,7 @@ class LLaDAEvalHarness(LM):
         is_check_greedy=True,
         steps=1024,
         gen_length=1024,
-        window_length=1024,
+        window_length=16,
         remasking='low_confidence',
         device="cuda",
         use_cache=False,
@@ -359,15 +359,14 @@ class LLaDAEvalHarness(LM):
                     for generated_answer in batched_generated_answer:
                         f.write(json.dumps(generated_answer, ensure_ascii=False) + '\n')
                         
-
-            print('=' * 20)
-            print('question: ', question)
-            print('answer: ', generated_answer)
-            print('Cache update frequency:', ratio)
-            print('=' * 20, end='\n\n')
+            for i in range(len(batched_generated_answer)):
+                print('=' * 20)
+                print('question: ', question)
+                print('answer: ', batched_generated_answer[i])
+                print('Cache update frequency:', ratio)
+                print('=' * 20, end='\n\n')
             
             # self.accelerator.wait_for_everyone()
-            print(f"Tokens per second: {num_tokens / (time.time() - start_time)}")
 
         end_time = time.time()
         if self.show_speed:

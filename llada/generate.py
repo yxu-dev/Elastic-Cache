@@ -21,7 +21,6 @@ import torch.nn.functional as F
 import os
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
-from visualize import *
 import math
 from einops import rearrange
 from copy import deepcopy
@@ -105,7 +104,7 @@ def generate_with_elastic_cache(
             start_reset = L
 
         positions = [query_position, track_position, query_masked_position, masked_position]
-        lengths = [x.shape[0], start_reset, gamma, track_num]
+        lengths = [x.shape[1], start_reset, gamma, track_num]
 
         output = model(x_query, use_cache=True, lengths=lengths, positions=positions)
         logits = output.logits
@@ -116,7 +115,7 @@ def generate_with_elastic_cache(
             logits = logits[:, -query_masked_position.shape[0]:, :]
 
         if not block_caching:
-            query_masked_position = masked_position[:window_length]
+            query_masked_position = query_masked_position[:window_length]
             logits = logits[:, :window_length]
         
         track_position = torch.cat([block.track_token for block in model.model.transformer.blocks], dim=0).unique(sorted=False)
@@ -139,7 +138,6 @@ def generate_with_elastic_cache(
         num_computed += L - lengths[1]
         total_computed += L
         
-
         if masked_position.shape[0] == 0:
             break
 

@@ -736,11 +736,10 @@ class LLaDABlock(nn.Module):
         attention_bias: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         positions: Optional[torch.Tensor] = None,
-        pos=None,
+        rotary_pos=None,
         lengths=None,
         block_idx=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        B, T, C = x.size()  # batch size, sequence length, d_model
         dtype = x.dtype
         query_position, track_position, query_masked_position, masked_position = positions
         key_len, start_reset, gamma, track_num = lengths
@@ -756,6 +755,8 @@ class LLaDABlock(nn.Module):
         q = self.q_proj(x_normed) #q:torch.Size([2, 168, 4096])
         k = self.k_proj(x_normed) #k:torch.Size([2, 168, 4096])
         v = self.v_proj(x_normed) #v:torch.Size([2, 168, 4096])
+
+        B, T, C = q.size()  # batch size, sequence length, d_model
 
         # Optionally apply layer norm to keys and queries.
         if self.q_norm is not None and self.k_norm is not None: #self.q_norm: None, self.k_norm: None
@@ -773,7 +774,7 @@ class LLaDABlock(nn.Module):
 
         if self.config.rope:
             # Apply rotary embeddings.
-            q, k = self.rotary_emb(q, k, pos)
+            q, k = self.rotary_emb(q, k, rotary_pos)
 
         if block_idx >= start_reset: # Cache update
             self.q_cache = q
@@ -903,6 +904,7 @@ class LLaDASequentialBlock(LLaDABlock):
         attention_bias: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
+        rotary_pos=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:

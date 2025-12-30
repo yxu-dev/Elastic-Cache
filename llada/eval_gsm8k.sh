@@ -6,9 +6,9 @@ task=gsm8k
 length=512
 window_length=16
 num_fewshot=5
-steps=$((length / block_length))
-model='GSAI-ML/LLaDA-8B-Instruct'
-# model='GSAI-ML/LLaDA-1.5'
+steps=$((length / window_length))
+# model='GSAI-ML/LLaDA-8B-Instruct'
+model='GSAI-ML/LLaDA-1.5'
 threshold=0.9
 gamma=0.9
 track_num=1
@@ -16,6 +16,6 @@ block_caching=True
 
 CUDA_VISIBLE_DEVICES=0 accelerate launch eval_llada.py --tasks ${task} --num_fewshot ${num_fewshot} \
 --confirm_run_unsafe_code --model llada_dist --batch_size 1 \
---model_args model_path=${model},gen_length=${length},steps=${steps},block_length=${block_length},threshold=${threshold},gamma=${gamma},track_num=${track_num},block_caching=${block_caching},show_speed=True
+--model_args model_path=${model},gen_length=${length},steps=${steps},window_length=${window_length},threshold=${threshold},gamma=${gamma},track_num=${track_num},block_caching=${block_caching},show_speed=True
 
 

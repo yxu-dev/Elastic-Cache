@@ -27,8 +27,8 @@
 
 ### Key Results
 
-| Metric                    | Value                          |
-| ------------------------- | ------------------------------ |
+| Metric                    |       Value         |
+|:-------------------------:|:------------------------:|
 | **Speedup**         | Upto 45.1x (GSM8K, 512 tokens) |
 | **Accuracy**        | 81.50% vs 80.36% baseline      |
 | **Code Generation** | 5x faster (HumanEval)          |
@@ -72,7 +72,7 @@ Our design is motivated by three key observations:
 ## Performance Results
 
 <div align="center">
-<img src="static/result.png" width="100%">
+<img src="static/result.png" width="90%">
 
 *Comprehensive benchmark results on the LLaDA-1.5 suite. Each cell shows accuracy (top) and decoding throughput in tokens/sec with relative speedup to the LLaDA baseline (bottom, blue: t/s; orange: speedup). Bold cells denote the highest throughput and speedup per configuration.*
 

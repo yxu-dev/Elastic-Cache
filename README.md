@@ -4,18 +4,18 @@
 
 <div align="center">
 
-[Quan Nguyen-Tri](https://scholar.google.com/citations?user=TBcqxpAAAAAJ&hl=en)`<sup>` * `</sup>` &nbsp;
-[Mukul Ranjan](https://mukul54.github.io/)`<sup>` * `</sup>` &nbsp;
+[Quan Nguyen-Tri](https://scholar.google.com/citations?user=TBcqxpAAAAAJ&hl=en)<sup> * </sup> &nbsp;
+[Mukul Ranjan](https://mukul54.github.io/)<sup> * </sup> &nbsp;
 [Zhiqiang Shen](https://zhiqiangshen.com/) &nbsp;
 
-`<sup>`*`</sup>`Equal Contribution
+<sup>*</sup>Equal Contribution
 
 [![arXiv](https://img.shields.io/badge/Paper-arXiv-red.svg)](https://arxiv.org/abs/2510.14973)
 [![Project](https://img.shields.io/static/v1?label=Project&message=Github&color=blue&logo=github-pages)](https://vila-lab.github.io/elastic-cache-webpage/)
 [![Our Page](https://img.shields.io/badge/Visit-Our%20Page-8C7AFF?style=flat)](https://vila-lab.github.io/elastic-cache-webpage/)
-[![GitHub issues](https://img.shields.io/github/issues/TimeBlindness/time-blindness?color=FFF359&label=issues&style=flat)](https://github.com/VILA-Lab/Elastic-Cache/issues)
-[![GitHub stars](https://img.shields.io/github/stars/TimeBlindness/time-blindness?color=FF6A07&style=flat)](https://github.com/VILA-Lab/Elastic-Cache/stargazers)
-[![GitHub license](https://img.shields.io/github/license/TimeBlindness/time-blindness?color=FF6666)](https://github.com/VILA-Lab/Elastic-Cache/blob/main/LICENSE)
+[![GitHub issues](https://img.shields.io/github/issues/VILA-Lab/Elastic-Cache?color=FFF359&label=issues&style=flat)](https://github.com/VILA-Lab/Elastic-Cache/issues)
+[![GitHub stars](https://img.shields.io/github/stars/VILA-Lab/Elastic-Cache?color=FF6A07&style=flat)](https://github.com/VILA-Lab/Elastic-Cache/stargazers)
+[![GitHub license](https://img.shields.io/github/license/VILA-Lab/Elastic-Cache?color=FF6666)](https://github.com/VILA-Lab/Elastic-Cache/blob/main/LICENSE)
 
 </div>
 

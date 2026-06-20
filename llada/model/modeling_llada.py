@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
+import copy
 from abc import abstractmethod
 from collections import defaultdict
 from functools import partial
@@ -90,6 +91,21 @@ __all__ = [
 
 
 log = logging.getLogger(__name__)
+
+
+def _copied_position_list(position):
+    return position.detach().cpu().clone().tolist()
+
+
+def _resolve_reuse_override(callback, context):
+    if callback is None:
+        return False
+    result = callback(copy.deepcopy(context))
+    if result is None:
+        return False
+    if result == "refresh":
+        return True
+    raise ValueError("reuse_override_callback must return None or 'refresh'")
 
 
 def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
@@ -739,10 +755,49 @@ class LLaDABlock(nn.Module):
         rotary_pos=None,
         lengths=None,
         block_idx=None,
+        decision_context=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         dtype = x.dtype
         query_position, track_position, query_masked_position, masked_position = positions
         key_len, start_reset, gamma, track_num = lengths
+        start_reset_before = int(start_reset)
+        base_decision = "refresh" if block_idx >= start_reset else "reuse"
+        final_decision = base_decision
+        override_applied = False
+        attention_similarity = None
+        similarity_status = (
+            "not_applicable_refresh"
+            if base_decision == "refresh"
+            else "pending"
+        )
+
+        if base_decision == "reuse" and decision_context is not None:
+            override_context = {
+                "event_type": "elastic_cache_reuse_override",
+                "step": int(decision_context["step"]),
+                "layer": int(block_idx),
+                "query_positions": _copied_position_list(query_position),
+                "track_positions": _copied_position_list(track_position),
+                "query_masked_positions": _copied_position_list(
+                    query_masked_position
+                ),
+                "masked_positions": _copied_position_list(masked_position),
+                "base_decision": "reuse",
+                "start_reset": start_reset_before,
+                "gamma": float(gamma),
+                "track_num": int(track_num),
+                "nfe": int(decision_context["nfe_before"]),
+                "compute_ratio": decision_context["compute_ratio_before"],
+            }
+            override_applied = _resolve_reuse_override(
+                decision_context.get("reuse_override_callback"),
+                override_context,
+            )
+            if override_applied:
+                lengths[1] = block_idx
+                start_reset = block_idx
+                final_decision = "refresh"
+                similarity_status = "not_computed_due_to_override"
 
         if block_idx > start_reset:
             self.x_cache = x
@@ -828,6 +883,8 @@ class LLaDABlock(nn.Module):
             past_att_weight = past_q @ past_k.transpose(-2, -1) * scale_factor
             past_att_weight = torch.softmax(past_att_weight, dim=-1)
             sim = F.cosine_similarity(past_att_weight, att_weight, dim=1).mean()
+            attention_similarity = float(sim.detach().float().cpu().item())
+            similarity_status = "computed"
             if sim < gamma:
                 lengths[1] = block_idx + 1
             
@@ -835,6 +892,33 @@ class LLaDABlock(nn.Module):
         masked_att_weight = masked_att_weight.sum(dim=(0, 1, 2))
         masked_att_weight[masked_position] = 0.0
         self.track_token = masked_att_weight.topk(k=track_num, dim=0, largest=True)[1]
+
+        if (
+            decision_context is not None
+            and decision_context.get("logging_enabled", False)
+        ):
+            decision_context["events"].append(
+                {
+                    "event_type": "elastic_cache_decision",
+                    "step": int(decision_context["step"]),
+                    "layer": int(block_idx),
+                    "query_positions": _copied_position_list(query_position),
+                    "track_positions": _copied_position_list(track_position),
+                    "query_masked_positions": _copied_position_list(
+                        query_masked_position
+                    ),
+                    "masked_positions": _copied_position_list(masked_position),
+                    "base_decision": base_decision,
+                    "final_decision": final_decision,
+                    "override_applied": override_applied,
+                    "start_reset_before": start_reset_before,
+                    "start_reset_after": int(lengths[1]),
+                    "attention_similarity": attention_similarity,
+                    "attention_similarity_status": similarity_status,
+                    "gamma": float(gamma),
+                    "track_num": int(track_num),
+                }
+            )
 
         # Apply output projection.
         return x, self.attn_out(att)
@@ -1010,6 +1094,7 @@ class LLaDALlamaBlock(LLaDABlock):
         rotary_pos=None,
         lengths=None,
         block_idx=None,
+        decision_context=None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # Get query, key, value projections.
         # shape:
@@ -1021,13 +1106,25 @@ class LLaDALlamaBlock(LLaDABlock):
 
         # Get attention scores.
         if self._activation_checkpoint_fn is not None:
-            x, att = self._activation_checkpoint_fn(  # type: ignore
-                self.attention, x, attention_bias, use_cache=use_cache, 
-                            rotary_pos=rotary_pos, positions=positions, lengths=lengths, block_idx=block_idx,
-            )
+            if decision_context is None:
+                x, att = self._activation_checkpoint_fn(  # type: ignore
+                    self.attention, x, attention_bias, use_cache=use_cache,
+                                rotary_pos=rotary_pos, positions=positions, lengths=lengths, block_idx=block_idx,
+                )
+            else:
+                x, att = self._activation_checkpoint_fn(  # type: ignore
+                    self.attention, x, attention_bias, use_cache=use_cache,
+                                rotary_pos=rotary_pos, positions=positions, lengths=lengths, block_idx=block_idx,
+                                decision_context=decision_context,
+                )
         else:
-            x, att = self.attention(x, attention_bias, use_cache=use_cache, 
-                            rotary_pos=rotary_pos, positions=positions, lengths=lengths, block_idx=block_idx,)
+            if decision_context is None:
+                x, att = self.attention(x, attention_bias, use_cache=use_cache,
+                                rotary_pos=rotary_pos, positions=positions, lengths=lengths, block_idx=block_idx,)
+            else:
+                x, att = self.attention(x, attention_bias, use_cache=use_cache,
+                                rotary_pos=rotary_pos, positions=positions, lengths=lengths, block_idx=block_idx,
+                                decision_context=decision_context,)
 
         # Add attention scores.
         # shape: (B, T, C)
@@ -1413,6 +1510,7 @@ class LLaDAModel(nn.Module):
         output_hidden_states: Optional[bool] = None,
         positions: Optional[torch.Tensor] = None,
         lengths=None,
+        decision_context=None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1544,12 +1642,20 @@ class LLaDAModel(nn.Module):
                     )
                 ):
                     # shape: (batch_size, seq_len, d_model)
-                    x = self._activation_checkpoint_fn(
-                        x, attention_bias=attention_bias, use_cache=use_cache, positions=positions, rotary_pos=rotary_pos, lengths=lengths, block_idx=block_idx
-                    )
+                    if decision_context is None:
+                        x = self._activation_checkpoint_fn(
+                            x, attention_bias=attention_bias, use_cache=use_cache, positions=positions, rotary_pos=rotary_pos, lengths=lengths, block_idx=block_idx
+                        )
+                    else:
+                        x = self._activation_checkpoint_fn(
+                            x, attention_bias=attention_bias, use_cache=use_cache, positions=positions, rotary_pos=rotary_pos, lengths=lengths, block_idx=block_idx, decision_context=decision_context
+                        )
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x = block(x, attention_bias=attention_bias, use_cache=use_cache, positions=positions, rotary_pos=rotary_pos, lengths=lengths, block_idx=block_idx)
+                    if decision_context is None:
+                        x = block(x, attention_bias=attention_bias, use_cache=use_cache, positions=positions, rotary_pos=rotary_pos, lengths=lengths, block_idx=block_idx)
+                    else:
+                        x = block(x, attention_bias=attention_bias, use_cache=use_cache, positions=positions, rotary_pos=rotary_pos, lengths=lengths, block_idx=block_idx, decision_context=decision_context)
                 
 
         else:
@@ -1633,6 +1739,7 @@ class LLaDAModelLM(PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        decision_context=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1643,16 +1750,29 @@ class LLaDAModelLM(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # import pdb; pdb.set_trace()
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model.forward(
-            input_ids=input_ids,
-            input_embeddings=inputs_embeds,
-            attention_mask=attention_mask,
-            attention_bias=attention_bias,
-            use_cache=use_cache,
-            output_hidden_states=output_hidden_states,
-            lengths=lengths,
-            positions=positions,
-        )
+        if decision_context is None:
+            outputs = self.model.forward(
+                input_ids=input_ids,
+                input_embeddings=inputs_embeds,
+                attention_mask=attention_mask,
+                attention_bias=attention_bias,
+                use_cache=use_cache,
+                output_hidden_states=output_hidden_states,
+                lengths=lengths,
+                positions=positions,
+            )
+        else:
+            outputs = self.model.forward(
+                input_ids=input_ids,
+                input_embeddings=inputs_embeds,
+                attention_mask=attention_mask,
+                attention_bias=attention_bias,
+                use_cache=use_cache,
+                output_hidden_states=output_hidden_states,
+                lengths=lengths,
+                positions=positions,
+                decision_context=decision_context,
+            )
 
         return outputs
 

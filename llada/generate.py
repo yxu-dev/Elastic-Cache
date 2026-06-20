@@ -16,6 +16,7 @@
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
 import torch
+import copy
 import numpy as np
 import torch.nn.functional as F
 import os
@@ -46,6 +47,8 @@ def generate_with_elastic_cache(
     mask_id=126336, eos_id=126081,
     threshold=0.9, tokens_per_iter=1,
     gamma=0.9, track_num=1, block_caching=True,
+    decision_logging_callback=None,
+    reuse_override_callback=None,
 ):
     '''
     Args:
@@ -106,8 +109,54 @@ def generate_with_elastic_cache(
         positions = [query_position, track_position, query_masked_position, masked_position]
         lengths = [x.shape[1], start_reset, gamma, track_num]
 
-        output = model(x_query, use_cache=True, lengths=lengths, positions=positions)
+        decision_context = None
+        if (
+            decision_logging_callback is not None
+            or reuse_override_callback is not None
+        ):
+            decision_context = {
+                "step": i,
+                "logging_enabled": decision_logging_callback is not None,
+                "reuse_override_callback": reuse_override_callback,
+                "events": [],
+                "nfe_before": nfe,
+                "compute_ratio_before": (
+                    num_computed / total_computed
+                    if total_computed > 0
+                    else None
+                ),
+            }
+
+        if decision_context is None:
+            output = model(
+                x_query,
+                use_cache=True,
+                lengths=lengths,
+                positions=positions,
+            )
+        else:
+            output = model(
+                x_query,
+                use_cache=True,
+                lengths=lengths,
+                positions=positions,
+                decision_context=decision_context,
+            )
         logits = output.logits
+
+        if decision_logging_callback is not None:
+            computed_layers = L - lengths[1]
+            cumulative_computed = num_computed + computed_layers
+            cumulative_total = total_computed + L
+            for event in decision_context["events"]:
+                record = {
+                    **event,
+                    "nfe": nfe + 1,
+                    "computed_layers": computed_layers,
+                    "total_layers": L,
+                    "compute_ratio": cumulative_computed / cumulative_total,
+                }
+                decision_logging_callback(copy.deepcopy(record))
 
         if logits.shape[1] == x.shape[1]:
             logits = logits[:, query_masked_position, :]

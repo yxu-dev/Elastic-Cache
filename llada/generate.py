@@ -142,6 +142,8 @@ def generate_with_elastic_cache(
             break
 
         i += 1
+        
+    x[x.eq(mask_id)] = eos_id
     return x, nfe, num_computed / total_computed
 
 

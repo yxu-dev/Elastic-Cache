@@ -29,8 +29,8 @@
 
 | Metric                    |       Value         |
 |:-------------------------:|:------------------------:|
-| **Speedup**         | Upto 45.1x (GSM8K, 512 tokens) |
-| **Accuracy**        | 81.50% vs 80.36% baseline      |
+| **Speedup**         | Upto 16.0x (GSM8K, 512 tokens) |
+| **Accuracy**        | 82.79% vs 81.35% baseline      |
 | **Code Generation** | 5x faster (HumanEval)          |
 
 ---
@@ -70,6 +70,8 @@ Our design is motivated by three key observations:
 ---
 
 ## Performance Results
+
+> <span style="color: #eb4925ff;"> A minor issue in the evaluation led to slightly inflated throughput numbers for our method on the GSM8K and MATH baselines. After correcting the evaluation, our method shows higher accuracy, with throughput slightly lower than previously reported.</span>
 
 <div align="center">
 <img src="static/result.png" width="90%">

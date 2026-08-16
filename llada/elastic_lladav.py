@@ -63,6 +63,7 @@ class ElasticLLaDAVController:
         self._step_record_indices: list[int] = []
         self.layer_cache: dict[int, dict[str, Any]] = {}
         self.decisions: list[dict[str, Any]] = []
+        self._previous_response_top1: dict[int, int] = {}
 
     @staticmethod
     def _stable_unique(values: Any) -> Any:
@@ -214,6 +215,8 @@ class ElasticLLaDAVController:
         refreshed = bool(runtime["refreshed"])
         previous = runtime["previous"]
         monitor = None
+        monitor_input_positions = self.track_positions.detach().cpu().tolist()
+        monitor_triggered_here = False
         if not refreshed and previous is not None and self.track_positions.numel() > 0:
             past_q = runtime["past_query"]
             past_k = runtime["past_key"]
@@ -236,6 +239,7 @@ class ElasticLLaDAVController:
                 ).mean().item()
             )
             if monitor < self.config.gamma:
+                monitor_triggered_here = True
                 self.refresh_start_layer = min(self.refresh_start_layer, layer + 1)
 
         masked_rows = self._query_rows(self.masked_positions, refreshed=refreshed)
@@ -268,16 +272,42 @@ class ElasticLLaDAVController:
             "block": self.block,
             "layer": layer,
             "elastic_monitor_value": monitor,
+            "monitor_input_positions": monitor_input_positions,
+            "next_tracked_positions": tracked.detach().cpu().tolist(),
             "gamma": self.config.gamma,
+            "monitor_margin_to_gamma": (
+                None if monitor is None else monitor - self.config.gamma
+            ),
             "confidence_threshold": None,
             "tracked_token": tracked.detach().cpu().tolist(),
+            "decision_before_layer": "recompute" if refreshed else "reuse",
+            "monitor_triggered_here": monitor_triggered_here,
+            "trigger_layer": layer if monitor_triggered_here else None,
+            "recompute_start_layer": int(self.refresh_start_layer),
+            "step_final_refresh_start_layer": None,
             "refresh": refreshed,
             "refresh_start_layer": int(self.refresh_start_layer),
             "recomputed": refreshed,
             "reused": not refreshed,
             "cache_age": self.step - last_refresh_step,
+            "cache_generation": last_refresh_step,
             "active_window": self.masked_positions.detach().cpu().tolist(),
+            "queried_masked_positions": self.masked_positions.detach().cpu().tolist(),
+            "queried_masked_count": int(self.masked_positions.numel()),
+            "remaining_masked_count": int(self.all_masked_positions.numel()),
             "token_role_summary": self._token_role_summary(),
+            "token_role_metadata": self._token_role_metadata(),
+            "signal_observability": {
+                "elastic_monitor_value": "online_observable",
+                "response_entropy": "online_observable",
+                "response_top1_flip_rate": "online_observable",
+                "response_margin": "online_observable",
+                "visual_attention_drift": "online_observable",
+                "visual_attention_mass": "online_observable",
+                "visual_attention_redistribution": "online_observable",
+                "visual_k_drift": "cached_state_comparison",
+                "visual_hidden_drift": "cached_state_comparison",
+            },
             **drift,
         }
         self.decisions.append(record)
@@ -290,6 +320,8 @@ class ElasticLLaDAVController:
         active = logits.index_select(1, self.masked_positions).float()
         if active.numel() == 0:
             entropy = None
+            top1_flip_rate = None
+            response_margin = None
         else:
             log_normalizer = torch.logsumexp(active, dim=-1)
             probabilities = torch.softmax(active, dim=-1)
@@ -297,12 +329,38 @@ class ElasticLLaDAVController:
                 torch.isfinite(active), probabilities * active, torch.zeros_like(active)
             )
             entropy = float((log_normalizer - weighted.sum(dim=-1)).mean().item())
+            top2 = torch.topk(active, k=2, dim=-1)
+            current_top1 = top2.indices[..., 0].reshape(-1).detach().cpu().tolist()
+            positions = self.masked_positions.detach().cpu().tolist()
+            comparable = [
+                int(current) != self._previous_response_top1[int(position)]
+                for position, current in zip(positions, current_top1)
+                if int(position) in self._previous_response_top1
+            ]
+            top1_flip_rate = (
+                sum(comparable) / len(comparable) if comparable else None
+            )
+            response_margin = float(
+                (top2.values[..., 0] - top2.values[..., 1]).mean().item()
+            )
+            self._previous_response_top1.update(
+                {
+                    int(position): int(token)
+                    for position, token in zip(positions, current_top1)
+                }
+            )
         for index in self._step_record_indices:
             self.decisions[index]["response_entropy"] = entropy
+            self.decisions[index]["response_top1_flip_rate"] = top1_flip_rate
+            self.decisions[index]["response_margin"] = response_margin
 
     def end_step(self) -> None:
         import torch
 
+        for index in self._step_record_indices:
+            self.decisions[index]["step_final_refresh_start_layer"] = int(
+                self.refresh_start_layer
+            )
         if self._next_track_positions:
             self.track_positions = self._stable_unique(
                 torch.cat(self._next_track_positions)
@@ -327,6 +385,8 @@ class ElasticLLaDAVController:
                 "visual_k_drift": None,
                 "visual_hidden_drift": None,
                 "visual_attention_drift": None,
+                "visual_attention_mass": None,
+                "visual_attention_redistribution": None,
             }, None)
         visual = [
             index
@@ -338,18 +398,28 @@ class ElasticLLaDAVController:
                 "visual_k_drift": None,
                 "visual_hidden_drift": None,
                 "visual_attention_drift": None,
+                "visual_attention_mass": None,
+                "visual_attention_redistribution": None,
             }, None)
         indices = self.query_positions.new_tensor(visual)
         masked_rows = self._query_rows(self.masked_positions, refreshed=refreshed)
-        visual_attention = attention_weights.index_select(2, masked_rows).index_select(
-            3, indices
-        ).float().mean(dim=(0, 1, 2))
+        visual_attention_rows = (
+            attention_weights.index_select(2, masked_rows)
+            .index_select(3, indices)
+            .float()
+        )
+        visual_attention_mass = float(
+            visual_attention_rows.sum(dim=-1).mean().item()
+        )
+        visual_attention = visual_attention_rows.mean(dim=(0, 1, 2))
         visual_attention = visual_attention / visual_attention.sum().clamp_min(1e-12)
         if previous is None:
             return ({
                 "visual_k_drift": None,
                 "visual_hidden_drift": None,
                 "visual_attention_drift": None,
+                "visual_attention_mass": visual_attention_mass,
+                "visual_attention_redistribution": None,
             }, visual_attention.detach().clone())
         current_hidden = hidden.index_select(1, indices)
         previous_hidden = previous["hidden"].index_select(1, indices)
@@ -357,6 +427,7 @@ class ElasticLLaDAVController:
         previous_key = previous["key"].index_select(2, indices)
         previous_attention = previous.get("visual_attention")
         visual_attention_drift = None
+        visual_attention_redistribution = None
         if previous_attention is not None:
             midpoint = 0.5 * (visual_attention + previous_attention)
             visual_attention_drift = float(
@@ -374,6 +445,9 @@ class ElasticLLaDAVController:
                     )
                 ).item()
             )
+            visual_attention_redistribution = float(
+                (0.5 * (visual_attention - previous_attention).abs().sum()).item()
+            )
         return ({
             "visual_k_drift": float(
                 (1.0 - functional.cosine_similarity(
@@ -386,7 +460,49 @@ class ElasticLLaDAVController:
                 )).mean().item()
             ),
             "visual_attention_drift": visual_attention_drift,
+            "visual_attention_mass": visual_attention_mass,
+            "visual_attention_redistribution": visual_attention_redistribution,
         }, visual_attention.detach().clone())
+
+    def _token_role_metadata(self) -> dict[str, dict[str, int]]:
+        if self.multimodal_layout is None:
+            return {"sequence": {}, "queried": {}}
+        token_types = list(self.multimodal_layout.get("token_types", []))
+        remaining_masked = {
+            int(value) for value in self.all_masked_positions.detach().cpu().tolist()
+        }
+        queried = {
+            int(value) for value in self.query_positions.detach().cpu().tolist()
+        }
+
+        def role(index: int, token_type: str) -> str:
+            if token_type == "visual":
+                return "visual"
+            if token_type == "prompt_text":
+                return "prompt"
+            if token_type.startswith("generated"):
+                return (
+                    "response_masked"
+                    if index in remaining_masked
+                    else "response_committed"
+                )
+            return "special"
+
+        names = (
+            "visual",
+            "prompt",
+            "response_committed",
+            "response_masked",
+            "special",
+        )
+        sequence_counts = {name: 0 for name in names}
+        queried_counts = {name: 0 for name in names}
+        for index, token_type in enumerate(token_types):
+            name = role(index, token_type)
+            sequence_counts[name] += 1
+            if index in queried:
+                queried_counts[name] += 1
+        return {"sequence": sequence_counts, "queried": queried_counts}
 
     def _token_role_summary(self) -> dict[str, int]:
         if self.multimodal_layout is None:

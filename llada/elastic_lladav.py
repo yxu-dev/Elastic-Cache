@@ -166,6 +166,11 @@ class ElasticLLaDAVController:
         }
         return full_hidden if refreshed else hidden_states
 
+    def full_hidden_for_audit(self, *, layer: int) -> Any:
+        """Expose the materialized layer input read-only to an isolated auditor."""
+
+        return self._layer_runtime[int(layer)]["hidden"]
+
     def materialize_kv(
         self,
         *,

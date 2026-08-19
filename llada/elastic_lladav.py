@@ -23,12 +23,19 @@ class ElasticLLaDAVConfig:
     # paper-style replication protocol because it can change native logits.
     block_caching: bool = False
     always_refresh: bool = False
+    forced_fresh_steps: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not -1.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be between -1 and 1")
         if self.track_num < 1:
             raise ValueError("track_num must be positive")
+        normalized = tuple(int(step) for step in self.forced_fresh_steps)
+        if any(step <= 0 for step in normalized):
+            raise ValueError("forced_fresh_steps must contain positive step indices")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("forced_fresh_steps must be unique")
+        object.__setattr__(self, "forced_fresh_steps", normalized)
 
 
 class ElasticLLaDAVController:
@@ -64,6 +71,7 @@ class ElasticLLaDAVController:
         self.layer_cache: dict[int, dict[str, Any]] = {}
         self.decisions: list[dict[str, Any]] = []
         self._previous_response_top1: dict[int, int] = {}
+        self.forced_fresh_once = False
 
     @staticmethod
     def _stable_unique(values: Any) -> Any:
@@ -108,7 +116,8 @@ class ElasticLLaDAVController:
         self._step_record_indices = []
 
         first_step = not self.layer_cache
-        if first_step or self.config.always_refresh:
+        self.forced_fresh_once = self.step in self.config.forced_fresh_steps
+        if first_step or self.config.always_refresh or self.forced_fresh_once:
             self.refresh_start_layer = 0
             self.query_positions = torch.arange(
                 self.sequence_length,
@@ -290,6 +299,10 @@ class ElasticLLaDAVController:
             "trigger_layer": layer if monitor_triggered_here else None,
             "recompute_start_layer": int(self.refresh_start_layer),
             "step_final_refresh_start_layer": None,
+            "forced_refresh_start_layer": (
+                0 if self.forced_fresh_once else None
+            ),
+            "forced_fresh_once": bool(self.forced_fresh_once),
             "refresh": refreshed,
             "refresh_start_layer": int(self.refresh_start_layer),
             "recomputed": refreshed,

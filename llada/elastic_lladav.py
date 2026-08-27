@@ -7,7 +7,7 @@ tracked-token attention monitor, and layer-aware refresh boundary.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 
@@ -23,19 +23,19 @@ class ElasticLLaDAVConfig:
     # paper-style replication protocol because it can change native logits.
     block_caching: bool = False
     always_refresh: bool = False
-    forced_fresh_steps: tuple[int, ...] = ()
+    forced_action_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not -1.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be between -1 and 1")
         if self.track_num < 1:
             raise ValueError("track_num must be positive")
-        normalized = tuple(int(step) for step in self.forced_fresh_steps)
-        if any(step <= 0 for step in normalized):
-            raise ValueError("forced_fresh_steps must contain positive step indices")
-        if len(set(normalized)) != len(normalized):
-            raise ValueError("forced_fresh_steps must be unique")
-        object.__setattr__(self, "forced_fresh_steps", normalized)
+        normalized = tuple(int(step) for step in self.forced_action_indices)
+        if any(step < 0 for step in normalized):
+            raise ValueError("forced_action_indices must be non-negative")
+        if any(left >= right for left, right in zip(normalized, normalized[1:])):
+            raise ValueError("forced_action_indices must be strictly increasing")
+        object.__setattr__(self, "forced_action_indices", normalized)
 
 
 class ElasticLLaDAVController:
@@ -71,7 +71,52 @@ class ElasticLLaDAVController:
         self.layer_cache: dict[int, dict[str, Any]] = {}
         self.decisions: list[dict[str, Any]] = []
         self._previous_response_top1: dict[int, int] = {}
+        self.forced_refresh = False
         self.forced_fresh_once = False
+        self.policy_refresh_start_layer: int | None = None
+        self.policy_query_token_count: int | None = None
+        self.policy_probe_compute_seconds = 0.0
+
+    def is_forced_action(self, step: int) -> bool:
+        return int(step) in self.config.forced_action_indices
+
+    def needs_policy_probe(self, step: int) -> bool:
+        return (
+            self.is_forced_action(step)
+            and bool(self.layer_cache)
+            and not self.config.always_refresh
+        )
+
+    def fork_policy_probe(self) -> "ElasticLLaDAVController":
+        """Fork the pre-action policy state without sharing mutable containers."""
+
+        if not self.layer_cache:
+            raise ValueError("policy probe requires an initialized cache")
+        probe = type(self)(
+            replace(self.config, forced_action_indices=()),
+            observer=None,
+        )
+        probe.layer_cache = dict(self.layer_cache)
+        probe.track_positions = (
+            None if self.track_positions is None else self.track_positions.clone()
+        )
+        probe._previous_response_top1 = dict(self._previous_response_top1)
+        return probe
+
+    def policy_counterfactual(self, *, probe_compute_seconds: float) -> dict[str, Any]:
+        """Return the completed natural-policy action for a forced-action fork."""
+
+        if self.step < 0 or self.query_positions is None:
+            raise ValueError("policy probe has not completed an action")
+        seconds = float(probe_compute_seconds)
+        if not math.isfinite(seconds) or seconds < 0.0:
+            raise ValueError("probe_compute_seconds must be finite and non-negative")
+        return {
+            "action_index": int(self.step),
+            "policy_refresh_start_layer": int(self.refresh_start_layer),
+            "policy_query_token_count": int(self.query_positions.numel()),
+            "policy_probe_compute_seconds": seconds,
+        }
 
     @staticmethod
     def _stable_unique(values: Any) -> Any:
@@ -98,6 +143,7 @@ class ElasticLLaDAVController:
         active_masked_positions: Any,
         newly_decoded_positions: Any,
         multimodal_layout: dict[str, Any] | None = None,
+        policy_counterfactual: dict[str, Any] | None = None,
     ) -> Any:
         import torch
 
@@ -116,8 +162,42 @@ class ElasticLLaDAVController:
         self._step_record_indices = []
 
         first_step = not self.layer_cache
-        self.forced_fresh_once = self.step in self.config.forced_fresh_steps
-        if first_step or self.config.always_refresh or self.forced_fresh_once:
+        self.forced_refresh = self.is_forced_action(self.step)
+        self.forced_fresh_once = self.forced_refresh
+        self.policy_refresh_start_layer = None
+        self.policy_query_token_count = None
+        self.policy_probe_compute_seconds = 0.0
+        if self.forced_refresh:
+            if first_step or self.config.always_refresh:
+                if policy_counterfactual is not None:
+                    raise ValueError(
+                        "first-step or always-refresh action does not accept a policy probe"
+                    )
+                self.policy_refresh_start_layer = 0
+                self.policy_query_token_count = self.sequence_length
+            else:
+                if policy_counterfactual is None:
+                    raise ValueError(
+                        "forced action requires a same-state policy counterfactual"
+                    )
+                if int(policy_counterfactual.get("action_index", -1)) != self.step:
+                    raise ValueError("policy counterfactual action index mismatch")
+                boundary = int(policy_counterfactual["policy_refresh_start_layer"])
+                query_count = int(policy_counterfactual["policy_query_token_count"])
+                if not 0 <= boundary <= len(self.layer_cache):
+                    raise ValueError("policy refresh boundary is outside the layer domain")
+                if not 0 <= query_count <= self.sequence_length:
+                    raise ValueError("policy query count is outside the sequence domain")
+                seconds = float(policy_counterfactual["policy_probe_compute_seconds"])
+                if not math.isfinite(seconds) or seconds < 0.0:
+                    raise ValueError(
+                        "policy probe compute seconds must be finite and non-negative"
+                    )
+                self.policy_refresh_start_layer = boundary
+                self.policy_query_token_count = query_count
+                self.policy_probe_compute_seconds = seconds
+
+        if first_step or self.config.always_refresh or self.forced_refresh:
             self.refresh_start_layer = 0
             self.query_positions = torch.arange(
                 self.sequence_length,
@@ -135,6 +215,8 @@ class ElasticLLaDAVController:
                     )
                 )
             )
+        if self.policy_query_token_count is None:
+            self.policy_query_token_count = int(self.query_positions.numel())
         return self.query_positions
 
     def restore_sequence(self, values: Any, *, fill_value: float = 0.0) -> Any:
@@ -283,6 +365,7 @@ class ElasticLLaDAVController:
         }
         record = {
             "step": self.step,
+            "action_index": self.step,
             "block": self.block,
             "layer": layer,
             "elastic_monitor_value": monitor,
@@ -299,10 +382,21 @@ class ElasticLLaDAVController:
             "trigger_layer": layer if monitor_triggered_here else None,
             "recompute_start_layer": int(self.refresh_start_layer),
             "step_final_refresh_start_layer": None,
+            "policy_refresh_start_layer": None,
+            "effective_refresh_start_layer": None,
             "forced_refresh_start_layer": (
-                0 if self.forced_fresh_once else None
+                0 if self.forced_refresh else None
             ),
+            "forced_refresh": bool(self.forced_refresh),
             "forced_fresh_once": bool(self.forced_fresh_once),
+            "natural_full_refresh_collision": None,
+            "marginal_recomputed_layers": None,
+            "marginal_layer_token_compute": None,
+            "policy_query_token_count": int(self.policy_query_token_count),
+            "effective_query_token_count": int(self.query_positions.numel()),
+            "policy_probe_compute_seconds": float(
+                self.policy_probe_compute_seconds
+            ),
             "refresh": refreshed,
             "refresh_start_layer": int(self.refresh_start_layer),
             "recomputed": refreshed,
@@ -372,13 +466,51 @@ class ElasticLLaDAVController:
             self.decisions[index]["response_top1_flip_rate"] = top1_flip_rate
             self.decisions[index]["response_margin"] = response_margin
 
-    def end_step(self) -> None:
+    def end_step(self, *, action_compute_seconds: float | None = None) -> None:
         import torch
 
+        effective_boundary = int(self.refresh_start_layer)
+        policy_boundary = (
+            int(self.policy_refresh_start_layer)
+            if self.policy_refresh_start_layer is not None
+            else effective_boundary
+        )
+        natural_collision = bool(self.forced_refresh and policy_boundary == 0)
+        marginal_layers = policy_boundary if self.forced_refresh else 0
+        effective_query_count = int(self.query_positions.numel())
+        policy_query_count = int(self.policy_query_token_count)
+        marginal_layer_token_compute = marginal_layers * max(
+            effective_query_count - policy_query_count,
+            0,
+        )
+        if action_compute_seconds is None:
+            instrumented_action_latency_ms = None
+            action_latency_ms = None
+        else:
+            action_seconds = float(action_compute_seconds)
+            if not math.isfinite(action_seconds) or action_seconds < 0.0:
+                raise ValueError(
+                    "action_compute_seconds must be finite and non-negative"
+                )
+            instrumented_action_latency_ms = action_seconds * 1000.0
+            action_latency_ms = max(
+                action_seconds - self.policy_probe_compute_seconds,
+                0.0,
+            ) * 1000.0
         for index in self._step_record_indices:
-            self.decisions[index]["step_final_refresh_start_layer"] = int(
-                self.refresh_start_layer
+            record = self.decisions[index]
+            record["step_final_refresh_start_layer"] = effective_boundary
+            record["policy_refresh_start_layer"] = policy_boundary
+            record["effective_refresh_start_layer"] = effective_boundary
+            record["natural_full_refresh_collision"] = natural_collision
+            record["marginal_recomputed_layers"] = marginal_layers
+            record["marginal_layer_token_compute"] = (
+                marginal_layer_token_compute
             )
+            record["instrumented_action_latency_ms"] = (
+                instrumented_action_latency_ms
+            )
+            record["latency_ms"] = action_latency_ms
         if self._next_track_positions:
             self.track_positions = self._stable_unique(
                 torch.cat(self._next_track_positions)

@@ -6,6 +6,7 @@ tracked-token attention monitor, and layer-aware refresh boundary.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -76,6 +77,63 @@ class ElasticLLaDAVController:
         self.policy_refresh_start_layer: int | None = None
         self.policy_query_token_count: int | None = None
         self.policy_probe_compute_seconds = 0.0
+
+    @staticmethod
+    def _clone_tree(value: Any, *, device: Any = None) -> Any:
+        """Clone controller tensors for an isolated branch state."""
+
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - controller runtime requires torch
+            torch = None
+        if torch is not None and isinstance(value, torch.Tensor):
+            cloned = value.detach().clone()
+            return cloned.cpu() if device == "cpu" else cloned.to(device)
+        if isinstance(value, dict):
+            return {
+                key: ElasticLLaDAVController._clone_tree(item, device=device)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                ElasticLLaDAVController._clone_tree(item, device=device)
+                for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                ElasticLLaDAVController._clone_tree(item, device=device)
+                for item in value
+            )
+        return copy.deepcopy(value)
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Capture the completed pre-action controller state on CPU."""
+
+        if self._layer_runtime:
+            raise RuntimeError("Elastic state can only be captured between actions")
+        return {
+            "schema_version": 1,
+            "completed_action_index": int(self.step),
+            "layer_cache": self._clone_tree(self.layer_cache, device="cpu"),
+            "track_positions": self._clone_tree(self.track_positions, device="cpu"),
+            "previous_response_top1": dict(self._previous_response_top1),
+        }
+
+    def restore_state(self, state: dict[str, Any], *, device: Any) -> None:
+        """Restore a state produced by :meth:`snapshot_state` for a new branch."""
+
+        if int(state.get("schema_version", -1)) != 1:
+            raise ValueError("unsupported Elastic branch-state schema")
+        self.reset()
+        self.step = int(state["completed_action_index"])
+        self.layer_cache = self._clone_tree(state["layer_cache"], device=device)
+        self.track_positions = self._clone_tree(
+            state.get("track_positions"), device=device
+        )
+        self._previous_response_top1 = {
+            int(position): int(token)
+            for position, token in state.get("previous_response_top1", {}).items()
+        }
 
     def is_forced_action(self, step: int) -> bool:
         return int(step) in self.config.forced_action_indices

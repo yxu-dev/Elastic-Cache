@@ -26,6 +26,7 @@ class ElasticLLaDAVConfig:
     always_refresh: bool = False
     forced_action_indices: tuple[int, ...] = ()
     record_forced_counterfactual: bool = True
+    capture_research_records: bool = True
 
     def __post_init__(self) -> None:
         if not -1.0 <= self.gamma <= 1.0:
@@ -373,7 +374,10 @@ class ElasticLLaDAVController:
         refreshed = bool(runtime["refreshed"])
         previous = runtime["previous"]
         monitor = None
-        monitor_input_positions = self.track_positions.detach().cpu().tolist()
+        monitor_input_positions = (
+            self.track_positions.detach().cpu().tolist()
+            if self.config.capture_research_records else None
+        )
         monitor_triggered_here = False
         if not refreshed and previous is not None and self.track_positions.numel() > 0:
             past_q = runtime["past_query"]
@@ -413,10 +417,13 @@ class ElasticLLaDAVController:
             if refreshed or previous is None
             else int(previous["last_refresh_step"])
         )
-        drift, visual_attention = self._compact_drift(
-            runtime["hidden"], runtime["key"], attention_weights, previous,
-            refreshed=refreshed,
-        )
+        if self.config.capture_research_records:
+            drift, visual_attention = self._compact_drift(
+                runtime["hidden"], runtime["key"], attention_weights, previous,
+                refreshed=refreshed,
+            )
+        else:
+            drift, visual_attention = {}, None
         self.layer_cache[layer] = {
             "hidden": runtime["hidden"],
             "query": runtime["query"].detach().clone(),
@@ -425,6 +432,9 @@ class ElasticLLaDAVController:
             "last_refresh_step": last_refresh_step,
             "visual_attention": visual_attention,
         }
+        if not self.config.capture_research_records:
+            del self._layer_runtime[layer]
+            return
         record = {
             "step": self.step,
             "action_index": self.step,
@@ -489,6 +499,8 @@ class ElasticLLaDAVController:
         del self._layer_runtime[layer]
 
     def observe_logits(self, logits: Any) -> None:
+        if not self.config.capture_research_records:
+            return
         import torch
 
         active = logits.index_select(1, self.masked_positions).float()

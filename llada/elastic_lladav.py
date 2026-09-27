@@ -27,12 +27,21 @@ class ElasticLLaDAVConfig:
     forced_action_indices: tuple[int, ...] = ()
     record_forced_counterfactual: bool = True
     capture_research_records: bool = True
+    window_beta: int | None = None
+    window_query_scope: str = "all_masks"
+    track_work_counts: bool = False
 
     def __post_init__(self) -> None:
         if not -1.0 <= self.gamma <= 1.0:
             raise ValueError("gamma must be between -1 and 1")
         if self.track_num < 1:
             raise ValueError("track_num must be positive")
+        if self.window_beta is not None and self.window_beta < 1:
+            raise ValueError("window_beta must be positive")
+        if self.window_query_scope not in {"all_masks", "window"}:
+            raise ValueError("window_query_scope must be all_masks or window")
+        if self.window_beta is None and self.window_query_scope != "all_masks":
+            raise ValueError("window query scope requires window_beta")
         normalized = tuple(int(step) for step in self.forced_action_indices)
         if any(step < 0 for step in normalized):
             raise ValueError("forced_action_indices must be non-negative")
@@ -79,6 +88,17 @@ class ElasticLLaDAVController:
         self.policy_refresh_start_layer: int | None = None
         self.policy_query_token_count: int | None = None
         self.policy_probe_compute_seconds = 0.0
+        self.window_positions: Any = None
+        self.transformer_query_rows = 0
+        self.lm_head_projection_rows = 0
+        self.output_processing_rows = 0
+        self.planned_commits = 0
+        self.actual_commits = 0
+        self.window_actions = 0
+        self.window_monitor_rows = 0
+        self.actions = 0
+        self.full_actions = 0
+        self.recomputed_layer_actions = 0
 
     @staticmethod
     def _clone_tree(value: Any, *, device: Any = None) -> Any:
@@ -213,9 +233,22 @@ class ElasticLLaDAVController:
         self.sequence_length = int(sequence_length)
         self.multimodal_layout = multimodal_layout
         self.all_masked_positions = masked_positions
-        self.masked_positions = (
-            active_masked_positions if self.config.block_caching else masked_positions
-        )
+        if self.config.window_beta is None:
+            self.window_positions = None
+            self.masked_positions = (
+                active_masked_positions if self.config.block_caching else masked_positions
+            )
+            query_masked_positions = self.masked_positions
+        else:
+            self.window_positions = active_masked_positions[: self.config.window_beta]
+            self.masked_positions = self.window_positions
+            query_masked_positions = (
+                masked_positions if self.config.window_query_scope == "all_masks"
+                else self.window_positions
+            )
+            if self.config.track_work_counts:
+                self.window_actions += 1
+                self.window_monitor_rows += int(self.window_positions.numel())
         if self.track_positions is None:
             self.track_positions = masked_positions[:0]
         self._next_track_positions = []
@@ -274,7 +307,7 @@ class ElasticLLaDAVController:
                     (
                         self.track_positions,
                         newly_decoded_positions,
-                        self.masked_positions,
+                        query_masked_positions,
                     )
                 )
             )
@@ -318,7 +351,10 @@ class ElasticLLaDAVController:
             "refreshed": refreshed,
             "hidden": full_hidden.detach().clone(),
         }
-        return full_hidden if refreshed else hidden_states
+        result = full_hidden if refreshed else hidden_states
+        if self.config.track_work_counts:
+            self.transformer_query_rows += int(result.shape[1])
+        return result
 
     def full_hidden_for_audit(self, *, layer: int) -> Any:
         """Expose the materialized layer input read-only to an isolated auditor."""
@@ -544,6 +580,10 @@ class ElasticLLaDAVController:
         import torch
 
         effective_boundary = int(self.refresh_start_layer)
+        if self.config.track_work_counts:
+            self.actions += 1
+            self.full_actions += int(effective_boundary == 0)
+            self.recomputed_layer_actions += len(self.layer_cache) - effective_boundary
         policy_boundary = (
             int(self.policy_refresh_start_layer)
             if self.policy_refresh_start_layer is not None

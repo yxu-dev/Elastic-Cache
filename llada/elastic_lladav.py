@@ -25,6 +25,7 @@ class ElasticLLaDAVConfig:
     block_caching: bool = False
     always_refresh: bool = False
     forced_action_indices: tuple[int, ...] = ()
+    record_forced_counterfactual: bool = True
 
     def __post_init__(self) -> None:
         if not -1.0 <= self.gamma <= 1.0:
@@ -143,6 +144,7 @@ class ElasticLLaDAVController:
             self.is_forced_action(step)
             and bool(self.layer_cache)
             and not self.config.always_refresh
+            and self.config.record_forced_counterfactual
         )
 
     def fork_policy_probe(self) -> "ElasticLLaDAVController":
@@ -233,7 +235,7 @@ class ElasticLLaDAVController:
                     )
                 self.policy_refresh_start_layer = 0
                 self.policy_query_token_count = self.sequence_length
-            else:
+            elif self.config.record_forced_counterfactual:
                 if policy_counterfactual is None:
                     raise ValueError(
                         "forced action requires a same-state policy counterfactual"
@@ -254,6 +256,8 @@ class ElasticLLaDAVController:
                 self.policy_refresh_start_layer = boundary
                 self.policy_query_token_count = query_count
                 self.policy_probe_compute_seconds = seconds
+            elif policy_counterfactual is not None:
+                raise ValueError("direct forced action does not accept a policy probe")
 
         if first_step or self.config.always_refresh or self.forced_refresh:
             self.refresh_start_layer = 0
